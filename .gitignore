@@ -1,0 +1,6 @@
+lut_research/images/
+lut_research/myenv/
+lut_research/output/
+lut_research/sam_vit_b_01ec64.pth
+
+__pycache__
