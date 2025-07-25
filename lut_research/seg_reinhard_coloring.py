@@ -22,7 +22,7 @@ from segment_anything import SamPredictor, sam_model_registry, SamAutomaticMaskG
 
 # CONFIGURATION
 INPUT_IMG  = "images/input3.png"      # Path to input image
-TARGET_IMG = "images/target5.png"     # Path to target image
+TARGET_IMG = "images/target4.png"     # Path to target image
 MODEL_TYPE = "vit_b"                  # SAM model type
 MODEL_PATH = "sam_vit_b_01ec64.pth"   # Path to SAM model weights
 WITH_GPU   = torch.cuda.is_available()
@@ -32,6 +32,9 @@ DEVICE     = "cuda" if WITH_GPU else "cpu"
 SEGMENTATION_WEIGHT = 40  # 0 = global only, 100 = segmentation only, 50 = blend
 EXPOSURE_MATCH = False    # Toggle exposure matching
 SHOW_SEGMENTATION = True  # Toggle segmentation overlay output
+
+# If True, apply the generated LUT to the input image and save as input_LUT_applied.png
+APPLY_LUT = True
 
 print("test")
 
@@ -187,26 +190,67 @@ def reinhard_transfer(input_bgr, mean1, std1, mean2, std2):
     out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     return out
 
-def write_reinhard_cube(path, mean1, std1, mean2, std2, size=33, exposure_scale=1.0):
+def srgb_to_linear(rgb):
     """
-    Writes a 3D LUT (.cube) file for the Reinhard color transfer, for use in color grading software.
+    Convert sRGB [0,1] to linear RGB [0,1].
     """
+    rgb = np.clip(rgb, 0, 1)
+    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    return linear
+
+def linear_to_srgb(rgb):
+    """
+    Convert linear RGB [0,1] to sRGB [0,1].
+    """
+    rgb = np.clip(rgb, 0, 1)
+    srgb = np.where(rgb <= 0.0031308, 12.92 * rgb, 1.055 * (rgb ** (1/2.4)) - 0.055)
+    return srgb
+
+def write_image_based_lut(path, input_img, output_img, size=33, k=8):
+    """
+    Generate a 3D LUT that, when applied to input_img, produces output_img.
+    For each LUT grid point (input color), use k-nearest neighbors in input_img and interpolate the corresponding output_img color.
+    Both images must be the same size and in uint8 BGR format.
+    LUT is written in .cube format, sRGB gamma-encoded [0,1].
+    Uses KD-tree for fast nearest neighbor search and inverse distance weighting.
+    Prints first few LUT entries for diagnostics.
+
+    NOTE: The mapping is FROM input_img TO output_img, so the LUT can be applied to input_img to produce output_img.
+    """
+    from scipy.spatial import cKDTree
+
+    assert input_img.shape == output_img.shape, "Input and output images must have the same shape"
+    h, w, _ = input_img.shape
+    # Convert to RGB for LUT mapping (OpenCV loads as BGR)
+    input_rgb = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB).reshape(-1, 3).astype(np.float32) / 255.0
+    output_rgb = cv2.cvtColor(output_img, cv2.COLOR_BGR2RGB).reshape(-1, 3).astype(np.float32) / 255.0
+
+    # Build KD-tree for fast nearest neighbor search
+    tree = cKDTree(input_rgb)
+
     with open(path, "w") as f:
-        f.write("TITLE \"ReinhardLUT\"\n")
-        f.write(f"LUT_3D_SIZE {size}\n")
-        f.write("DOMAIN_MIN 0.0 0.0 0.0\n")
-        f.write("DOMAIN_MAX 1.0 1.0 1.0\n")
+        f.write(f'TITLE "ImageBasedLUT ({size}x{size}x{size})"\n')
+        f.write(f"LUT_3D_SIZE {size}\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n")
+
+        # Build LUT grid
+        grid = np.linspace(0, 1, size)
+        diagnostic_prints = 0
         for r in range(size):
             for g in range(size):
                 for b in range(size):
-                    rgb = np.array([r, g, b]) / (size - 1) * 255
-                    lab = cv2.cvtColor(rgb.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)[0, 0]
-                    # Exposure match
-                    lab[0] = np.clip(lab[0] * exposure_scale, 0, 255)
-                    lab2 = (lab - mean1) * (std2 / std1) + mean2
-                    lab2 = np.clip(lab2, 0, 255).astype(np.uint8).reshape(1, 1, 3)
-                    rgb2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)[0, 0] / 255.0
-                    f.write(f"{rgb2[0]:.6f} {rgb2[1]:.6f} {rgb2[2]:.6f}\n")
+                    rgb = np.array([grid[r], grid[g], grid[b]])
+                    # k-nearest neighbors and inverse distance weighting
+                    dists, idxs = tree.query(rgb, k=k)
+                    dists = np.maximum(dists, 1e-6)
+                    weights = 1.0 / dists
+                    weights /= weights.sum()
+                    out_rgb = np.sum(output_rgb[idxs] * weights[:, None], axis=0)
+                    f.write(f"{out_rgb[2]:.6f} {out_rgb[1]:.6f} {out_rgb[0]:.6f}\n")
+
+                    # Diagnostic: print first few LUT entries
+                    if diagnostic_prints < 10:
+                        print(f"LUT grid RGB: {rgb}, mapped to output RGB: {out_rgb}, input nearest: {input_rgb[idxs[0]]}, output nearest: {output_rgb[idxs[0]]}")
+                        diagnostic_prints += 1
 
 def blend_stats(seg_stat, global_stat, weight):
     """
@@ -218,6 +262,55 @@ def blend_stats(seg_stat, global_stat, weight):
     mean = alpha * seg_stat[0] + (1 - alpha) * global_stat[0]
     std  = alpha * seg_stat[1] + (1 - alpha) * global_stat[1]
     return mean, std
+
+def load_cube_lut(cube_path):
+    """
+    Loads a 3D LUT from a .cube file.
+    Returns: lut (size, size, size, 3), size (int)
+    """
+    lut = []
+    size = None
+    with open(cube_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("TITLE"):
+                continue
+            if line.startswith("LUT_3D_SIZE"):
+                size = int(line.split()[1])
+                continue
+            if line[0].isdigit() or line[0] == "-":
+                vals = [float(x) for x in line.split()]
+                lut.append(vals)
+    if size is None:
+        raise ValueError("LUT_3D_SIZE not found in .cube file")
+    lut = np.array(lut).reshape((size, size, size, 3))
+    return lut, size
+
+def apply_ocio_lut(img_bgr, lut_path):
+    """
+    Applies a .cube LUT to an image using OpenColorIO.
+    Expects img_bgr as uint8, LUT as .cube file path.
+    Returns: img_bgr_out (uint8)
+    """
+    import PyOpenColorIO as ocio
+
+    # Convert BGR to RGB and scale to [0,1]
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    h, w, c = img_rgb.shape
+    img_flat = img_rgb.reshape(-1, 3)
+
+    # Set up OCIO config and processor for the LUT
+    config = ocio.Config.CreateRaw()
+    processor = config.getProcessor(ocio.FileTransform(src=lut_path, direction=ocio.TRANSFORM_DIR_FORWARD))
+    cpu = processor.getDefaultCPUProcessor()
+
+    # Apply LUT to all pixels (use only cpu.applyRGBs)
+    img_lut = img_flat.copy()
+    cpu.applyRGB(img_lut)
+    img_lut = np.clip(np.array(img_lut), 0, 1).reshape(h, w, 3)
+    img_lut_uint8 = (img_lut * 255).round().astype(np.uint8)
+    img_bgr_out = cv2.cvtColor(img_lut_uint8, cv2.COLOR_RGB2BGR)
+    return img_bgr_out
 
 def main():
     """
@@ -321,25 +414,34 @@ def main():
         out_img_blend = reinhard_transfer(inp_blend, blend_m1, blend_s1, blend_m2, blend_s2)
         cv2.imwrite(os.path.join(out, "input_reinhard_blend.png"), out_img_blend)
 
-    # Write LUT (.cube) for blended transfer
-    lut_path = os.path.join(out, "reinhard_blend.cube")
-    print("Writing blended LUT…")
-    # Use blended stats and exposure scale for LUT
-    exposure_scale = 1.0
-    if SEGMENTATION_WEIGHT == 100:
-        exposure_scale = exposure_scale_seg
-        mean1, std1, mean2, std2 = seg_m1, seg_s1, seg_m2, seg_s2
-    elif SEGMENTATION_WEIGHT == 0:
-        exposure_scale = exposure_scale_glob
-        mean1, std1, mean2, std2 = glob_m1, glob_s1, glob_m2, glob_s2
-    else:
-        exposure_scale = get_exposure_scale(blend_m1[0], blend_m2[0])
-        mean1, std1, mean2, std2 = blend_m1, blend_s1, blend_m2, blend_s2
-    write_reinhard_cube(lut_path, mean1, std1, mean2, std2, size=33, exposure_scale=exposure_scale)
-
     # Save original input and target images for comparison
     cv2.imwrite(os.path.join(out, "input_orig.png"), inp)
+    cv2.imwrite(os.path.join(out, "input_reinhard_classaware.png"), out_img_seg)
     cv2.imwrite(os.path.join(out, "target_orig.png"), tgt)
+
+    # Write LUT (.cube) for blended transfer
+    lut_path = os.path.join(out, "reinhard_blend.cube")
+    print("Writing image-based LUT from input_orig.png to input_reinhard_classaware.png...")
+    # Load the two images
+    input_orig_path = os.path.join(out, "input_orig.png")
+    input_reinhard_path = os.path.join(out, "input_reinhard_classaware.png")
+    input_img = cv2.imread(input_orig_path)
+    output_img = cv2.imread(input_reinhard_path)
+    if input_img is None or output_img is None:
+        print("ERROR: Could not read input_orig.png or input_reinhard_classaware.png for LUT generation.")
+        return
+    write_image_based_lut(lut_path, input_img, output_img, size=33)
+
+    # Optionally apply the generated LUT to the input image and save
+    if APPLY_LUT:
+        print("Applying generated LUT to input image using OpenColorIO...")
+        out_lut_path = os.path.join(out, "output_LUT.png")
+        try:
+            img_lut_applied = apply_ocio_lut(inp, lut_path)
+            cv2.imwrite(out_lut_path, img_lut_applied)
+            print(f"LUT-applied result saved as {out_lut_path}")
+        except ImportError:
+            print("PyOpenColorIO is not installed. Please install it with 'pip install opencolorio' to use OCIO LUT application.")
 
     print(f"Done. Results in {out}")
 
